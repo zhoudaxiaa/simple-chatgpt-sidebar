@@ -1,0 +1,106 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: 校验并打包
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 准备 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 准备 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 读取版本号
+        id: meta
+        run: |
+          VERSION=$(python -c "import json; print(json.load(open('manifest.json'))['version'])")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "manifest 版本：$VERSION"
+
+      - name: 校验清单引用与 DOM 契约
+        run: python tools/validate.py
+
+      - name: 检查 JS 语法
+        run: |
+          set -e
+          for f in content.js chatgpt-inject.js options.js sidepanel.js prompt-input.js; do
+            node --check "$f"
+            echo "ok  $f"
+          done
+          for f in background.js session-bridge.js shared/defaults.js shared/template.js; do
+            cp "$f" /tmp/check.mjs
+            node --check /tmp/check.mjs
+            echo "ok  $f"
+          done
+
+      - name: 单元测试
+        run: |
+          node test_template.mjs
+          node tools/test_bridge.mjs
+
+      - name: 打包
+        run: |
+          python tools/build_zip.py --out "dist/simple-chatgpt-sidebar-${{ steps.meta.outputs.version }}.zip"
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: simple-chatgpt-sidebar-${{ steps.meta.outputs.version }}
+          path: dist/*.zip
+          if-no-files-found: error
+
+  release:
+    name: 发布 Release
+    needs: build
+    # 只有推 v* 标签才发版；往 main 推代码只做校验和打包
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: 下载构建产物
+        uses: actions/download-artifact@v4
+        with:
+          name: simple-chatgpt-sidebar-${{ needs.build.outputs.version }}
+          path: dist
+
+      - name: 校验 tag 与 manifest 版本一致
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          VERSION="${{ needs.build.outputs.version }}"
+          if [ "$TAG" != "$VERSION" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} 与 manifest.json 的版本 ${VERSION} 不一致"
+            exit 1
+          fi
+          echo "tag 与 manifest 版本一致：$VERSION"
+
+      - name: 创建或更新 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.build.outputs.version }}
+          name: v${{ needs.build.outputs.version }}
+          files: dist/*.zip
+          generate_release_notes: true
+          fail_on_unmatched_files: true

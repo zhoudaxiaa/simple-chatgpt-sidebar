@@ -110,7 +110,9 @@ node tools/test_bridge.mjs
 python tools/build_zip.py --out dist/package.zip
 ```
 
-推送到 `main` 会跑完整流水线并把 zip 作为 artifact 上传；打 `v*` 标签会额外发一个 Release 并附上资源包。
+推送到 `main` 会跑完整流水线并把 zip 作为 artifact 上传；打 `v*` 标签会额外发一个 Release 并附上资源包，标签名必须与 `manifest.json` 里的 `version` 一致，不一致流水线直接失败。
+
+发版就三步：改 `manifest.json` 的 `version` → 提交推送 → `git tag v1.0.0 && git push origin v1.0.0`。
 
 ## 已知限制
 
