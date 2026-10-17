@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<!--
+  Simple ChatGPT Sidebar — options page.
+
+  Two independent prompt libraries (page / selection), each entry being a
+  context-menu item. Deletions go to a session-only trash so an accidental
+  delete is recoverable until the page is closed.
+-->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ChatGPT 侧边栏设置</title>
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>ChatGPT 侧边栏设置</h1>
+      <div class="header-actions">
+        <button class="btn btn-secondary btn-small" id="restore-defaults">恢复默认</button>
+        <button class="btn btn-secondary btn-small" id="open-trash">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+            <polyline points="3 6 5 6 21 6"/>
+            <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+          </svg>
+          回收站 <span id="trash-count" class="badge hidden">0</span>
+        </button>
+      </div>
+    </header>
+
+    <section class="settings-section">
+      <h2>常规设置</h2>
+      <div class="setting-item">
+        <div class="setting-info">
+          <span class="setting-name">自动发送</span>
+          <span class="setting-description">把文字填进输入框后自动按回车发送</span>
+        </div>
+        <label class="toggle-switch">
+          <input type="checkbox" id="auto-submit-toggle">
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+    </section>
+
+    <section class="settings-section">
+      <h2>桌面端同步</h2>
+
+      <div class="setting-item">
+        <div class="setting-info">
+          <span class="setting-name">把 ChatGPT 登录态同步到桌面端</span>
+          <span class="setting-description">读取浏览器里 chatgpt.com / openai.com 的 Cookie，发送给本机运行的 Electron 套壳。只走本机回环地址，不会外发</span>
+        </div>
+        <label class="toggle-switch">
+          <input type="checkbox" id="bridge-auto">
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+
+      <div class="setting-item">
+        <div class="setting-info">
+          <span class="setting-name">接收地址</span>
+          <span class="setting-description">Electron 主进程监听的导入接口</span>
+        </div>
+        <input type="text" id="bridge-url" class="text-input" spellcheck="false" autocomplete="off">
+      </div>
+
+      <div class="setting-item">
+        <div class="setting-info">
+          <span class="setting-name">校验令牌</span>
+          <span class="setting-description">需与桌面端一致，放在 <code>x-bridge-token</code> 请求头里</span>
+        </div>
+        <input type="text" id="bridge-token" class="text-input" spellcheck="false" autocomplete="off">
+      </div>
+
+      <div class="setting-item">
+        <div class="setting-info">
+          <span class="setting-name">立即同步</span>
+          <span class="setting-description" id="bridge-status">还没同步过</span>
+        </div>
+        <button class="btn btn-primary btn-small" id="bridge-sync">同步</button>
+      </div>
+    </section>
+
+    <main class="columns">
+      <section class="column">
+        <div class="column-header">
+          <h2>页面提示词</h2>
+          <button class="btn btn-primary btn-small" data-add="page">+ 添加</button>
+        </div>
+        <p class="help-text">在网页任意位置右键即可看到</p>
+        <div class="prompts-list" id="page-prompts-list"></div>
+      </section>
+
+      <section class="column">
+        <div class="column-header">
+          <h2>选中文字提示词</h2>
+          <button class="btn btn-primary btn-small" data-add="selection">+ 添加</button>
+        </div>
+        <p class="help-text">选中文字后右键即可看到</p>
+        <div class="prompts-list" id="selection-prompts-list"></div>
+      </section>
+    </main>
+
+    <!-- Add / edit prompt -->
+    <div id="modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h3 id="modal-title">编辑提示词</h3>
+          <button id="modal-close" class="close-btn" aria-label="关闭">×</button>
+        </div>
+
+        <form id="prompt-form">
+          <div class="form-group">
+            <label for="prompt-name">菜单名称</label>
+            <input type="text" id="prompt-name" placeholder="例如：总结要点" required>
+          </div>
+
+          <div class="form-group">
+            <label for="prompt-template">提示词内容</label>
+            <textarea id="prompt-template" rows="3" placeholder="例如：请总结以下内容：" required></textarea>
+            <span class="hint" id="template-hint"></span>
+          </div>
+
+          <div class="form-group checkbox-group" id="include-url-group">
+            <label class="checkbox-label">
+              <input type="checkbox" id="prompt-include-url">
+              <span>自动附带页面标题和链接</span>
+            </label>
+            <span class="hint">也可以在内容里用 {title} 和 {url} 占位符</span>
+          </div>
+
+          <div class="form-actions">
+            <button type="button" id="modal-cancel" class="btn btn-secondary">取消</button>
+            <button type="submit" class="btn btn-primary">保存</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <!-- Trash -->
+    <div id="trash-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="trash-title">
+      <div class="modal-content modal-wide">
+        <div class="modal-header">
+          <h3 id="trash-title">回收站</h3>
+          <button id="trash-modal-close" class="close-btn" aria-label="关闭">×</button>
+        </div>
+
+        <p class="help-text">删掉的提示词会暂存在这里，关闭本页后清空。</p>
+
+        <div id="trash-list" class="trash-list"></div>
+        <div id="trash-empty" class="empty-state">回收站是空的</div>
+
+        <div class="form-actions">
+          <button type="button" id="empty-trash" class="btn btn-secondary">清空回收站</button>
+          <button type="button" id="trash-done" class="btn btn-primary">完成</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Restore confirmation -->
+    <div id="confirm-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
+      <div class="modal-content modal-small">
+        <div class="modal-header">
+          <h3 id="confirm-title">恢复默认提示词？</h3>
+          <button id="confirm-close" class="close-btn" aria-label="关闭">×</button>
+        </div>
+        <p class="confirm-text">缺失的默认提示词会被补回来，你自己添加的会保留。</p>
+        <div class="form-actions">
+          <button type="button" id="confirm-cancel" class="btn btn-secondary">取消</button>
+          <button type="button" id="confirm-yes" class="btn btn-primary">恢复</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="modal-backdrop" class="modal-backdrop hidden"></div>
+
+    <div id="toast" class="toast hidden" role="status" aria-live="polite">
+      <span id="toast-message"></span>
+    </div>
+  </div>
+
+  <script type="module" src="options.js"></script>
+</body>
+</html>

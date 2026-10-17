@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<!--
+  Simple ChatGPT Sidebar — side panel shell.
+
+  The whole panel is ChatGPT itself inside an iframe. The extension only adds a
+  floating toast that confirms what was sent, because the iframe cannot tell us.
+-->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ChatGPT 侧边栏</title>
+  <link rel="stylesheet" href="sidepanel.css">
+</head>
+<body>
+  <div id="container">
+    <!-- Delivery toast: the iframe cannot report what happened inside it -->
+    <div id="notification" class="notification hidden" role="status" aria-live="polite">
+      <span id="notification-text">已复制，按 Ctrl+V 粘贴</span>
+      <button id="dismiss-notification" class="dismiss-btn" title="关闭" aria-label="关闭">×</button>
+    </div>
+
+    <!-- ChatGPT itself. X-Frame-Options / CSP are stripped by rules.json -->
+    <iframe
+      id="chatgpt-frame"
+      src="https://chatgpt.com/"
+      allow="clipboard-read; clipboard-write"
+      referrerpolicy="no-referrer"
+    ></iframe>
+  </div>
+  <script src="sidepanel.js"></script>
+</body>
+</html>

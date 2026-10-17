@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<!--
+  Simple ChatGPT Sidebar — custom prompt popup.
+
+  Opened from "Custom prompt…" in the page context menu. The side panel is
+  already opening behind it; this window only collects the instruction and
+  hands it to the service worker.
+-->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>自定义提问</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      min-width: 400px;
+      padding: 20px;
+      background: #242424;
+      color: #e5e5e5;
+      font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    h2 {
+      margin-bottom: 16px;
+      color: #fff;
+      font-size: 16px;
+      font-weight: 600;
+    }
+
+    .page-info {
+      margin-bottom: 16px;
+      padding: 12px;
+      border-radius: 6px;
+      background: #1a1a1a;
+      font-size: 13px;
+    }
+
+    .page-info .label {
+      margin-bottom: 4px;
+      color: #888;
+      font-size: 11px;
+      letter-spacing: 0.5px;
+      text-transform: uppercase;
+    }
+
+    .page-info .title,
+    .page-info .url {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .page-info .title {
+      color: #fff;
+      font-weight: 500;
+    }
+
+    .page-info .url {
+      margin-top: 4px;
+      color: #10a37f;
+      font-size: 12px;
+    }
+
+    .form-group {
+      margin-bottom: 16px;
+    }
+
+    .form-group label {
+      display: block;
+      margin-bottom: 8px;
+      color: #ccc;
+      font-size: 13px;
+    }
+
+    .form-group textarea {
+      width: 100%;
+      min-height: 104px;
+      padding: 12px;
+      border: 1px solid #333;
+      border-radius: 6px;
+      background: #1a1a1a;
+      color: #e5e5e5;
+      font-family: inherit;
+      font-size: 14px;
+      resize: vertical;
+    }
+
+    .form-group textarea:focus {
+      border-color: #10a37f;
+      outline: none;
+    }
+
+    .hint {
+      margin-top: 6px;
+      color: #666;
+      font-size: 12px;
+    }
+
+    .hint code {
+      padding: 1px 4px;
+      border-radius: 3px;
+      background: #333;
+      color: #10a37f;
+    }
+
+    .actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+    }
+
+    .btn {
+      padding: 10px 20px;
+      border: none;
+      border-radius: 6px;
+      font-family: inherit;
+      font-size: 14px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: background 150ms;
+    }
+
+    .btn:focus-visible {
+      outline: 2px solid #10a37f;
+      outline-offset: 2px;
+    }
+
+    .btn-primary {
+      background: #10a37f;
+      color: #fff;
+    }
+
+    .btn-primary:hover {
+      background: #0d8a6a;
+    }
+
+    .btn-secondary {
+      background: #333;
+      color: #e5e5e5;
+    }
+
+    .btn-secondary:hover {
+      background: #444;
+    }
+  </style>
+</head>
+<body>
+  <h2>自定义提问</h2>
+
+  <div class="page-info">
+    <div class="label">当前页面</div>
+    <div class="title" id="page-title">加载中…</div>
+    <div class="url" id="page-url"></div>
+  </div>
+
+  <div class="form-group">
+    <label for="custom-prompt">你的问题</label>
+    <textarea id="custom-prompt" placeholder="输入你想问 ChatGPT 的内容…"></textarea>
+    <div class="hint">
+      页面标题和链接会自动附加；如果你自己写了
+      <code>{title}</code> 或 <code>{url}</code>，则按占位符替换。
+    </div>
+  </div>
+
+  <div class="actions">
+    <button class="btn btn-secondary" id="cancel-btn">取消</button>
+    <button class="btn btn-primary" id="send-btn">发送到 ChatGPT</button>
+  </div>
+
+  <script src="prompt-input.js"></script>
+</body>
+</html>
