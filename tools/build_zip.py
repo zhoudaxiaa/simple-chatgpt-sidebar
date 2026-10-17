@@ -17,7 +17,7 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_OUT = ROOT.parent / "dist" / "simple-chatgpt-sidebar-1.3.0.zip"
+DEFAULT_OUT = ROOT / "dist" / "simple-chatgpt-sidebar-1.0.0.zip"
 
 # 运行期文件白名单，顺序即包内顺序
 FILES = [
