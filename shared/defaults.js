@@ -53,7 +53,7 @@ export const DEFAULT_PAGE_PROMPTS = [
 export const DEFAULT_SELECTION_PROMPTS = [
   { id: 'chatgpt-explain', name: '解释这段内容', template: '解释一下：\n\n{text}', enabled: true },
   { id: 'chatgpt-summarize', name: '总结要点', template: '总结以下内容：\n\n{text}', enabled: true },
-  { id: 'chatgpt-translate', name: '翻译成英文', template: '把下面内容翻译成英文：\n\n{text}', enabled: true },
+  { id: 'chatgpt-translate', name: '翻译成中文', template: '把下面内容翻译成中文：\n\n{text}', enabled: true },
   { id: 'chatgpt-grammar', name: '修正语法', template: '修正下面内容的语法错误：\n\n{text}', enabled: true },
   { id: 'chatgpt-code', name: '解释这段代码', template: '解释这段代码在做什么：\n\n{text}', enabled: true },
   { id: 'chatgpt-bugs', name: '找出代码问题', template: '找出这段代码里的 bug：\n\n{text}', enabled: true }
@@ -109,8 +109,16 @@ export function localizePrompts(list, defaults) {
     // The second half of each test matters: a legacy value can equal the
     // current one (page-send-url has an empty template in both languages), and
     // patching it anyway would report a change that is not there.
-    if (entry.name === legacy.name && entry.name !== target.name) patch.name = target.name;
-    if (entry.template === legacy.template && entry.template !== target.template) {
+    const isLegacyName =
+      entry.name === legacy.name ||
+      (entry.id === 'chatgpt-translate' && entry.name === '翻译成英文');
+    const isLegacyTemplate =
+      entry.template === legacy.template ||
+      (entry.id === 'chatgpt-translate' &&
+        entry.template === '把下面内容翻译成英文：\n\n{text}');
+
+    if (isLegacyName && entry.name !== target.name) patch.name = target.name;
+    if (isLegacyTemplate && entry.template !== target.template) {
       patch.template = target.template;
     }
 

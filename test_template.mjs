@@ -87,6 +87,26 @@ ok(
   )[0].name === '找出代码问题'
 );
 
+const migratedTranslateFromEn = localizePrompts(
+  [{ id: 'chatgpt-translate', name: 'Translate to English', template: 'Translate this to English:\n\n{text}' }],
+  DEFAULT_SELECTION_PROMPTS
+)[0];
+eq('translate default migrates from English', migratedTranslateFromEn.name, '翻译成中文');
+eq('translate template migrates from English', migratedTranslateFromEn.template, '把下面内容翻译成中文：\n\n{text}');
+
+const migratedTranslateFromZhTypo = localizePrompts(
+  [{ id: 'chatgpt-translate', name: '翻译成英文', template: '把下面内容翻译成英文：\n\n{text}' }],
+  DEFAULT_SELECTION_PROMPTS
+)[0];
+eq('translate default migrates from mistranslated Chinese', migratedTranslateFromZhTypo.name, '翻译成中文');
+eq('translate template migrates from mistranslated Chinese', migratedTranslateFromZhTypo.template, '把下面内容翻译成中文：\n\n{text}');
+
+const customTranslate = localizePrompts(
+  [{ id: 'chatgpt-translate', name: '翻译成日语', template: '翻译成日语：\n\n{text}' }],
+  DEFAULT_SELECTION_PROMPTS
+)[0];
+eq('custom translate prompt is not overwritten', customTranslate.name, '翻译成日语');
+
 // --- session bridge ----------------------------------------------------------
 
 const cookie = (domain, name, path = '/') => ({ domain, name, path, value: 'x' });
