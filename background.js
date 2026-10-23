@@ -4,8 +4,9 @@
  * Responsibilities
  *   1. Register every context menu from the stored prompt lists.
  *   2. Turn a context-menu click into a fully formatted prompt.
- *   3. Publish that prompt on a single storage channel (`pendingPaste`)
- *      which the ChatGPT inject script consumes.
+ *   3. Publish that prompt on the storage channel (`paste:<id>` keys)
+ *      which the ChatGPT inject script consumes, and read back the
+ *      per-delivery ack it publishes on `pendingPasteAck`.
  *   4. Open the browser side panel — the only surface that keeps ChatGPT
  *      logged in, because Chrome computes the cookie "site for cookies" from
  *      the top-level frame and only an extension page counts as first-party.
@@ -13,8 +14,11 @@
  *
  * Design note: the original build used two competing delivery channels
  * (postMessage + storage) and the side panel re-wrote the same key it was
- * listening to, which produced double pastes. Here storage is the *only*
- * channel: writers are background/popup, the reader is the inject script.
+ * listening to, which produced double pastes. Storage is still the *only*
+ * channel, but it is now two-way: one `paste:<id>` key per delivery, and an
+ * ack the inject script writes back after it either filled the composer or
+ * gave up. That ack is what the toast reports — a bare storage write is not
+ * evidence that ChatGPT ever received anything.
  */
 
 import {
@@ -24,7 +28,8 @@ import {
   cloneSelectionPrompts,
   localizePrompts
 } from './shared/defaults.js';
-import { formatPagePrompt, formatSelectionPrompt } from './shared/template.js';
+import { formatPagePrompt, formatSelectionPrompt, stripEmptyLabels } from './shared/template.js';
+import { resolvePageInfo } from './shared/page-info.js';
 import { readBridgeConfig, syncSession } from './session-bridge.js';
 
 // =============================================================================
@@ -54,10 +59,23 @@ const KEY = {
   pagePrompts: 'pagePrompts',
   selectionPrompts: 'selectionPrompts',
   autoSubmit: 'autoSubmit',
-  pendingPaste: 'pendingPaste',
+  /**
+   * One storage key per delivery: `paste:<id>`. A single shared slot would
+   * overwrite an in-flight prompt and forced read-modify-write on every
+   * consumer; distinct keys mean the inject script only ever deletes the
+   * exact item it handled.
+   */
+  pastePrefix: 'paste:',
+  /** Pre-1.1 single slot. Swept on boot so old payloads cannot replay. */
+  legacyPaste: 'pendingPaste',
   pageInfo: 'promptInputPageInfo',
   promptTabId: 'promptInputTabId'
 };
+
+/** A delivery older than this is dropped instead of pasted late. */
+const PASTE_TTL = 30000;
+/** Stale keys are swept at twice the TTL to leave the consumer room to react. */
+const PASTE_SWEEP_AGE = PASTE_TTL * 4;
 
 // =============================================================================
 // Boot
@@ -79,6 +97,15 @@ chrome.runtime.onStartup.addListener(() => {
 // fire onInstalled, and the localisation migration below has to reach installs
 // that were created while the defaults were still English.
 void seedDefaults();
+
+// Which build is actually running is the first question in every bug report,
+// and "I reloaded it" is not proof. One line on every worker boot settles it.
+console.log(`[sidebar] background v${chrome.runtime.getManifest().version}`);
+
+// Drops the pre-1.1 single slot. The old reader replayed whatever it found
+// there on every panel load, so a failed delivery from an older build could
+// still surface as a phantom paste in the composer.
+void chrome.storage.local.remove(KEY.legacyPaste);
 
 /**
  * Writes the default prompt lists into storage the first time the extension
@@ -304,20 +331,50 @@ function openPopupWindow() {
 
 /**
  * Publishes a prompt for the inject script to paste into the ChatGPT composer.
- * A monotonically increasing id makes every write observable, even when the
- * text is byte-identical to the previous one (storage.onChanged would
- * otherwise stay silent).
+ *
+ * The write only means "handed to the panel" — it does NOT mean the text
+ * reached the composer, which is why every delivery carries its own key and
+ * the inject script answers on `pendingPasteAck`. The panel's toast waits for
+ * that ack instead of firing on the write.
+ *
+ * A fresh id also makes every write observable, even when the text is
+ * byte-identical to the previous one (storage.onChanged would otherwise stay
+ * silent on the same key).
+ *
  * @param {string} text
+ * @returns {Promise<string|null>} the delivery id
  */
 async function deliverPrompt(text) {
-  if (!text) return;
+  if (!text) return null;
+
+  const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const preview = text.length > 42 ? `${text.slice(0, 42)}…` : text;
+
   await chrome.storage.local.set({
-    [KEY.pendingPaste]: {
-      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      text,
-      ts: Date.now()
-    }
+    [KEY.pastePrefix + id]: { id, text, preview, ts: Date.now() }
   });
+
+  void sweepStalePastes();
+  return id;
+}
+
+/**
+ * Removes deliveries nobody consumed (the panel was closed before the inject
+ * script could run). Without this they would pile up in storage forever and,
+ * worse, could be replayed long after the user asked for them.
+ */
+async function sweepStalePastes() {
+  try {
+    const all = await chrome.storage.local.get(null);
+    const now = Date.now();
+    const stale = Object.keys(all).filter(key => {
+      if (!key.startsWith(KEY.pastePrefix)) return false;
+      return now - (all[key]?.ts || 0) > PASTE_SWEEP_AGE;
+    });
+    if (stale.length) await chrome.storage.local.remove(stale);
+  } catch {
+    /* storage hiccup: the next write sweeps again */
+  }
 }
 
 // =============================================================================
@@ -330,14 +387,17 @@ async function deliverPrompt(text) {
 // that often is exactly what the standalone bridge got wrong.
 // =============================================================================
 
-/** Flashes the outcome on the toolbar icon for four seconds. */
-function showSyncBadge(result) {
-  const text = result.ok ? '✓' : result.reason === 'empty' ? '0' : '!';
-  const color = result.ok ? '#10a37f' : '#c0392b';
-
+/** Flashes a character on the toolbar icon for four seconds. */
+function flashIcon(text, color = '#c0392b') {
   chrome.action.setBadgeBackgroundColor({ color }).catch(() => {});
   chrome.action.setBadgeText({ text }).catch(() => {});
   setTimeout(() => chrome.action.setBadgeText({ text: '' }).catch(() => {}), 4000);
+}
+
+/** Flashes the outcome on the toolbar icon for four seconds. */
+function showSyncBadge(result) {
+  const text = result.ok ? '✓' : result.reason === 'empty' ? '0' : '!';
+  flashIcon(text, result.ok ? '#10a37f' : '#c0392b');
 }
 
 /** Manual sync: always reports, because the user asked for it. */
@@ -389,6 +449,14 @@ chrome.commands.onCommand.addListener(async command => {
 });
 
 // =============================================================================
+// Page identity
+//
+// See shared/page-info.js: the Tab handed over by contextMenus.onClicked has no
+// url/title unless the extension holds the `tabs` permission, so the identity is
+// resolved against the page instead.
+// =============================================================================
+
+// =============================================================================
 // Context menu clicks
 // =============================================================================
 
@@ -413,7 +481,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
     // makes a later sidePanel.open() fail.
     openSidePanel(tab);
     await chrome.storage.local.set({
-      [KEY.pageInfo]: { title: tab?.title || '', url: tab?.url || '' },
+      [KEY.pageInfo]: await resolvePageInfo(chrome, tab),
       [KEY.promptTabId]: tab?.id ?? null
     });
     chrome.windows.create({
@@ -457,7 +525,17 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (id.startsWith(PAGE_PREFIX)) {
     const promptId = id.slice(PAGE_PREFIX.length);
     const prompt = page.find(p => p.id === promptId);
-    if (prompt) await deliverPrompt(formatPagePrompt(prompt, tab || {}));
+    if (!prompt) return;
+
+    const body = formatPagePrompt(prompt, await resolvePageInfo(chrome, tab));
+    if (body) {
+      await deliverPrompt(body);
+    } else {
+      // Nothing to send: the page has no identity to attach (a chrome:// page,
+      // the PDF viewer, a page where the content script is not allowed).
+      // Better a red "!" than a menu item that appears to do nothing.
+      flashIcon('!');
+    }
   }
 });
 
@@ -474,7 +552,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       return true;
 
     case 'CUSTOM_PROMPT_SUBMIT':
-      deliverPrompt(message.prompt)
+      deliverPrompt(stripEmptyLabels(message.prompt))
         .then(() => chrome.storage.local.remove([KEY.pageInfo, KEY.promptTabId]))
         .then(() => sendResponse({ ok: true }))
         .catch(err => sendResponse({ ok: false, error: String(err) }));

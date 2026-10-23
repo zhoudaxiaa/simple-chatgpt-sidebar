@@ -76,7 +76,7 @@ simple-chatgpt-sidebar/
 ├── session-bridge.js      登录态桥接：取 Cookie、去重、POST 到本机套壳
 ├── content.js             只回答 GET_SELECTION，供 Alt+G 命令调用
 ├── chatgpt-inject.js      注入 ChatGPT：MutationObserver 等待 + insertText
-├── sidepanel.html/.js/.css 面板页面：ChatGPT iframe + 发送提示 toast
+├── sidepanel.html/.js   面板页面：内联样式 + 延后挂载的 ChatGPT iframe + 发送提示 toast
 ├── options.html/.js/.css  提示词管理 + 桌面端同步配置
 ├── prompt-input.html/.js  自定义提示词弹窗
 ├── rules.json             DNR：剥离 XFO / CSP
@@ -100,19 +100,33 @@ simple-chatgpt-sidebar/
 # 静态校验：清单引用是否都存在、页面里的 id 是否都能被脚本取到
 python tools/validate.py
 
-# 单元测试：模板渲染 / 英文旧数据迁移 / Cookie 去重（20 例）
+# 单元测试：模板渲染 / 英文旧数据迁移 / Cookie 去重（34 例）
 node test_template.mjs
+
+# 投递链路：vm 里跑真实注入脚本，验证认领 / 回执 / 失败清理 / TTL（30 例）
+node test_delivery.mjs
+
+# 页面身份回退链：content script → activeTab 注入 → Tab 字段（6 例）
+node test_page_info.mjs
 
 # 端到端：真起一个 node:http 服务验证桥接请求（10 例）
 node tools/test_bridge.mjs
 
-# 打包
+# 打包（默认出 zip）
 python tools/build_zip.py --out dist/package.zip
+
+# 只出干净的未打包目录，给 chrome://extensions 加载用
+python tools/build_zip.py --unpacked
+
+# 目录和 zip 都要
+python tools/build_zip.py --unpacked --with-zip
 ```
+
+`chrome://extensions` 的「加载已解压的扩展程序」只认**目录**，不接受 zip。直接选仓库根目录也能跑（Chrome 只按 `manifest.json` 的引用加载，测试脚本不会被读），但根目录里有 `dist/`、`tools/`、若干 `test_*.mjs`，眼不见为净的话就用 `--unpacked` 出的 `dist/unpacked/`——它和 zip 的内容逐字节同源，只有白名单里那 20 个文件。
 
 推送到 `main` 会跑完整流水线并把 zip 作为 artifact 上传；打 `v*` 标签会额外发一个 Release 并附上资源包，标签名必须与 `manifest.json` 里的 `version` 一致，不一致流水线直接失败。
 
-发版就三步：改 `manifest.json` 的 `version` → 提交推送 → `git tag v1.0.0 && git push origin v1.0.0`。
+发版就三步：改 `manifest.json` 的 `version` → 提交推送 → `git tag v<version> && git push origin v<version>`（标签名必须与 manifest 一致）。
 
 ## 已知限制
 
@@ -170,7 +184,7 @@ UI 层      右键菜单          侧边栏 sidepanel.html    设置页 options.
                 ▼                    │                     ▼                      ▼
 后台层      ┌──────────────────────────────────────────────────────────────────────┐
            │ background.js · Service Worker                                       │
-           │ 菜单构建 · 模板渲染 · sidePanel.open() · 单一投递通道 pendingPaste     │
+           │ 菜单构建 · 模板渲染 · sidePanel.open() · 投递 paste:<id> → 等回执   │
            │ MV3 下随时会被回收，因此所有状态都放在 chrome.storage，不驻留内存      │
            └──────────────────────────────────────────────────────────────────────┘
                 │ tabs.sendMessage                      │ storage.onChanged
@@ -198,19 +212,27 @@ Chrome 把 `info.selectionText` 和 `tab`（含 title / url）交给 `contextMen
 
 **2. 模板渲染** `background.js`
 
-按菜单 id 找到对应提示词，把 `{text}` 替换成选中内容；页面级提示词还会追加 `Title: …` / `URL: …` 两行。`includeUrl` 为 false 时跳过追加。
+按菜单 id 找到对应提示词，把 `{text}` 替换成选中内容；页面级提示词还会追加 `标题：…` / `链接：…` 两行。`includeUrl` 为 false 时跳过追加，标题或链接缺失的那一行也不会写（否则会发出空标签，纯属浪费一次提问）。
+
+这里有个坑：`contextMenus.onClicked` 给的 `tab` 上 `url` / `title` 默认是空的 —— Chrome 只在扩展拥有 `tabs` 权限、或对该页面有 host 权限时才填。本扩展两者都没有（也不想要那个「读取浏览历史」的权限提示），所以改成向页面里的 `content.js` 要 `document.title` 和 `location.href`，在页面内读这两个值不需要任何权限。
 
 **3. 投递** `chrome.storage.local`
 
-把结果写进 `pendingPaste` 键。这是跨上下文最省事的通道：写入即广播，不需要知道谁在监听、iframe 有没有加载完。
+每次投递写一个**独立的** `paste:<id>` 键，而不是共用一个槽位。写入即广播，写入方不需要知道谁在监听、iframe 有没有加载完；独立键让消费方只删自己认领的那一条，两条投递不会互相覆盖，也不存在数组队列的「读-改-写」丢更新。
 
-**4. 消费** `chatgpt-inject.js`
+**4. 消费 + 回执** `chatgpt-inject.js`
 
-侧边栏 iframe 里的内容脚本收到 `storage.onChanged`，查找输入框，写入文本，绿色闪两下，然后清掉 `pendingPaste` 防止重复粘贴。
+只有「父文档是 `chrome-extension://` 且本帧能找到输入框」的 frame 才认领投递。它最多等 20 秒让 ChatGPT 的 SPA 起来，写入后用**空白无关**的比对确认真进了编辑器，然后写 `pendingPasteAck = {id, ok, reason}`，最后删掉自己认领的那个键。超过 30 秒的投递直接丢弃，不会在下次开面板时重放。
 
 **5. 反馈** `sidepanel.js`
 
-侧边栏自己也监听同一个键，只用来弹一条 toast 显示前 40 个字符 —— 它不发消息、不碰 iframe。
+面板先弹「正在发送…」，等的是**回执**而不是写入：`ok` 才显示「已填入输入框」，失败给出具体原因，25 秒收不到回执就提示重试。
+
+> **这里踩过的坑：写入成功 ≠ 插入成功**
+>
+> 早期版本在 `pendingPaste` 一被写入时就弹「已发送到 ChatGPT」，而这时面板可能刚打开、ChatGPT 还在加载。消费端等 3 秒拿不到输入框就 `return`，既不清键也不报错 —— 于是 toast 说成功、输入框是空的。更糟的是那句 `element.textContent.trim() !== text.trim()`：ProseMirror 把 `\n\n` 变成多个段落，`textContent` 拼接后不含换行，多行提示词必然比对失败，于是走进「清空 + 塞一个 `<p>`」的破坏性回退，绕过编辑器 state，下一次 React 渲染就把字擦掉了。
+>
+> 所以投递变成了两段式：写入只代表「交出去了」，成功与否只由回执说了算。
 
 > **原版在这里有一处竞态**
 >

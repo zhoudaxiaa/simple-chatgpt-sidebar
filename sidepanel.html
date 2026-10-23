@@ -2,31 +2,392 @@
 <!--
   Simple ChatGPT Sidebar — side panel shell.
 
-  The whole panel is ChatGPT itself inside an iframe. The extension only adds a
-  floating toast that confirms what was sent, because the iframe cannot tell us.
+  Two deliberate choices, both about the blank frame the user sees first:
+
+  1. All CSS is inlined. A <link> to a separate stylesheet blocks first paint,
+     and until it lands the panel is an unstyled white document. Inline rules
+     paint the loading cover on the very first frame, even if nothing else has
+     loaded yet.
+
+  2. There is no <iframe> in the markup. The frame is created and attached by
+     the script after the cover has painted once, so the white about:blank
+     document it starts with can never be what the user sees.
+
+  The colours follow ChatGPT's own theme: the OS preference first (that is all
+  that is available before the frame reports anything), then the real theme
+  forwarded by the inject script.
 -->
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>ChatGPT 侧边栏</title>
-  <link rel="stylesheet" href="sidepanel.css">
+  <style>
+    /* --- Theme tokens ---------------------------------------------------- */
+
+    :root {
+      color-scheme: dark;
+
+      --panel-bg: #212121;
+      --overlay-bg: #1a1a1a;
+      --overlay-glow: rgba(255, 255, 255, 0.045);
+      --text-strong: #ececec;
+      --text-hint: #8e8e8e;
+      --text-version: #4f4f4f;
+      --ring-track: rgba(255, 255, 255, 0.16);
+      --bar-track: rgba(255, 255, 255, 0.08);
+      --btn-border: rgba(255, 255, 255, 0.22);
+      --btn-hover: rgba(255, 255, 255, 0.08);
+      --btn-hover-border: rgba(255, 255, 255, 0.4);
+    }
+
+    /*
+      The light palette appears twice: once for the OS preference (so the very
+      first frame is already right, before any script runs) and once for the
+      explicit override the inject script sends. Keep the two blocks in sync.
+    */
+    @media (prefers-color-scheme: light) {
+      :root {
+        color-scheme: light;
+
+        --panel-bg: #ffffff;
+        --overlay-bg: #ffffff;
+        --overlay-glow: rgba(0, 0, 0, 0.028);
+        --text-strong: #2f2f2f;
+        --text-hint: #8a8a8a;
+        --text-version: #c8c8c8;
+        --ring-track: rgba(0, 0, 0, 0.1);
+        --bar-track: rgba(0, 0, 0, 0.06);
+        --btn-border: rgba(0, 0, 0, 0.18);
+        --btn-hover: rgba(0, 0, 0, 0.05);
+        --btn-hover-border: rgba(0, 0, 0, 0.32);
+      }
+    }
+
+    :root[data-theme='dark'] {
+      color-scheme: dark;
+
+      --panel-bg: #212121;
+      --overlay-bg: #1a1a1a;
+      --overlay-glow: rgba(255, 255, 255, 0.045);
+      --text-strong: #ececec;
+      --text-hint: #8e8e8e;
+      --text-version: #4f4f4f;
+      --ring-track: rgba(255, 255, 255, 0.16);
+      --bar-track: rgba(255, 255, 255, 0.08);
+      --btn-border: rgba(255, 255, 255, 0.22);
+      --btn-hover: rgba(255, 255, 255, 0.08);
+      --btn-hover-border: rgba(255, 255, 255, 0.4);
+    }
+
+    :root[data-theme='light'] {
+      color-scheme: light;
+
+      --panel-bg: #ffffff;
+      --overlay-bg: #ffffff;
+      --overlay-glow: rgba(0, 0, 0, 0.028);
+      --text-strong: #2f2f2f;
+      --text-hint: #8a8a8a;
+      --text-version: #c8c8c8;
+      --ring-track: rgba(0, 0, 0, 0.1);
+      --bar-track: rgba(0, 0, 0, 0.06);
+      --btn-border: rgba(0, 0, 0, 0.18);
+      --btn-hover: rgba(0, 0, 0, 0.05);
+      --btn-hover-border: rgba(0, 0, 0, 0.32);
+    }
+
+    /* --- Shell ------------------------------------------------------------ */
+
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      height: 100%;
+      width: 100%;
+      overflow: hidden;
+      /* Never leave a frame unpainted: an unstyled document flashes white. */
+      background: var(--panel-bg);
+      font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, sans-serif;
+    }
+
+    #container {
+      position: relative;
+      height: 100%;
+      width: 100%;
+      background: var(--panel-bg);
+    }
+
+    /* --- ChatGPT frame ---------------------------------------------------- */
+
+    #chatgpt-frame {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      border: none;
+      background: var(--panel-bg);
+    }
+
+    /* --- Loading cover ---------------------------------------------------- */
+
+    /*
+      Above the frame, below the toast (1000), so a delivery confirmation stays
+      readable while ChatGPT is booting.
+    */
+    #loading-overlay {
+      position: absolute;
+      inset: 0;
+      z-index: 900;
+
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+
+      background: var(--overlay-bg);
+      background-image: radial-gradient(
+        circle at 50% 42%,
+        var(--overlay-glow) 0%,
+        rgba(0, 0, 0, 0) 62%
+      );
+      color: var(--text-strong);
+
+      transition: opacity 220ms ease, background-color 120ms linear;
+    }
+
+    .loading-bar {
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 2px;
+      overflow: hidden;
+      background: var(--bar-track);
+    }
+
+    .loading-bar span {
+      display: block;
+      width: 42%;
+      height: 100%;
+      background: linear-gradient(
+        90deg,
+        rgba(16, 163, 127, 0),
+        #10a37f 40%,
+        #19c37d 60%,
+        rgba(16, 163, 127, 0)
+      );
+      animation: bar-slide 1.5s cubic-bezier(0.65, 0, 0.35, 1) infinite;
+    }
+
+    @keyframes bar-slide {
+      0% {
+        transform: translateX(-100%);
+      }
+      100% {
+        transform: translateX(340%);
+      }
+    }
+
+    #loading-overlay.is-done {
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    .loading-mark {
+      position: relative;
+      width: 64px;
+      height: 64px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .loading-mark img {
+      width: 34px;
+      height: 34px;
+      border-radius: 8px;
+    }
+
+    .loading-ring {
+      position: absolute;
+      inset: 0;
+      border-radius: 50%;
+      border: 3px solid var(--ring-track);
+      border-top-color: #10a37f;
+      border-right-color: rgba(16, 163, 127, 0.45);
+      animation: ring-spin 800ms linear infinite;
+    }
+
+    @keyframes ring-spin {
+      to {
+        transform: rotate(360deg);
+      }
+    }
+
+    .loading-text {
+      max-width: 84%;
+      font-size: 13px;
+      line-height: 1.6;
+      text-align: center;
+      color: var(--text-strong);
+    }
+
+    .loading-hint {
+      max-width: 84%;
+      font-size: 11px;
+      line-height: 1.5;
+      text-align: center;
+      color: var(--text-hint);
+    }
+
+    .loading-version {
+      position: absolute;
+      right: 8px;
+      bottom: 6px;
+      font-size: 10px;
+      color: var(--text-version);
+      letter-spacing: 0.02em;
+    }
+
+    .retry-btn {
+      padding: 6px 14px;
+      border: 1px solid var(--btn-border);
+      border-radius: 999px;
+      background: transparent;
+      color: var(--text-strong);
+      font-size: 12px;
+      cursor: pointer;
+      transition: background 150ms, border-color 150ms;
+    }
+
+    .retry-btn:hover {
+      background: var(--btn-hover);
+      border-color: var(--btn-hover-border);
+    }
+
+    /* --- Toast ------------------------------------------------------------ */
+
+    .notification {
+      position: absolute;
+      top: 10px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 1000;
+
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      max-width: 88%;
+
+      padding: 8px 10px 8px 12px;
+      border-radius: 8px;
+      background: linear-gradient(135deg, #10a37f 0%, #0d8a6a 100%);
+      box-shadow: 0 2px 12px rgba(0, 0, 0, 0.4);
+
+      color: #fff;
+      font-size: 12px;
+      font-weight: 500;
+
+      animation: toast-in 240ms cubic-bezier(0.2, 0.9, 0.3, 1);
+    }
+
+    @keyframes toast-in {
+      from {
+        transform: translateX(-50%) translateY(-120%);
+        opacity: 0;
+      }
+      to {
+        transform: translateX(-50%) translateY(0);
+        opacity: 1;
+      }
+    }
+
+    #notification-text {
+      flex: 1;
+      min-width: 0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .dismiss-btn {
+      flex-shrink: 0;
+      width: 18px;
+      height: 18px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+
+      border: none;
+      border-radius: 4px;
+      background: rgba(255, 255, 255, 0.2);
+      color: #fff;
+      font-size: 14px;
+      line-height: 1;
+      cursor: pointer;
+      transition: background 150ms;
+    }
+
+    .dismiss-btn:hover {
+      background: rgba(255, 255, 255, 0.32);
+    }
+
+    /* --- Utilities -------------------------------------------------------- */
+
+    .hidden {
+      display: none !important;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .notification {
+        animation: none;
+      }
+
+      .loading-ring {
+        animation: none;
+        border-top-color: var(--ring-track);
+        border-left-color: #10a37f;
+        border-bottom-color: #10a37f;
+      }
+
+      .loading-bar span {
+        animation: none;
+        transform: translateX(70%);
+      }
+
+      #loading-overlay {
+        transition: none;
+      }
+    }
+  </style>
 </head>
 <body>
   <div id="container">
+    <!-- Painted on the first frame; the ChatGPT frame is attached below it. -->
+    <div id="loading-overlay" role="status" aria-live="polite">
+      <div class="loading-bar" aria-hidden="true"><span></span></div>
+
+      <div class="loading-mark" aria-hidden="true">
+        <span class="loading-ring"></span>
+        <img src="icons/icon48.png" alt="" width="34" height="34">
+      </div>
+      <p id="loading-text" class="loading-text">正在打开 ChatGPT…</p>
+      <p class="loading-hint">首次打开需要几秒，之后会快一些</p>
+      <button id="loading-retry" class="retry-btn hidden" type="button">重新加载</button>
+      <span id="loading-version" class="loading-version"></span>
+    </div>
+
     <!-- Delivery toast: the iframe cannot report what happened inside it -->
     <div id="notification" class="notification hidden" role="status" aria-live="polite">
       <span id="notification-text">已复制，按 Ctrl+V 粘贴</span>
       <button id="dismiss-notification" class="dismiss-btn" title="关闭" aria-label="关闭">×</button>
     </div>
-
-    <!-- ChatGPT itself. X-Frame-Options / CSP are stripped by rules.json -->
-    <iframe
-      id="chatgpt-frame"
-      src="https://chatgpt.com/"
-      allow="clipboard-read; clipboard-write"
-      referrerpolicy="no-referrer"
-    ></iframe>
   </div>
   <script src="sidepanel.js"></script>
 </body>

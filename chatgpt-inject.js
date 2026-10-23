@@ -1,15 +1,24 @@
 /**
  * Simple ChatGPT Sidebar — ChatGPT composer injector.
  *
- * Injected into every frame of chatgpt.com. Watches the `pendingPaste` storage
- * key and writes the incoming prompt into ChatGPT's composer.
+ * Injected into every frame of chatgpt.com. Claims the `paste:<id>` deliveries
+ * written by the service worker, types them into the composer, and reports the
+ * outcome on `pendingPasteAck` — the side panel shows *that*, not the write,
+ * because a successful storage write is no evidence that the text ever landed.
+ *
+ * Only the frame that has both an extension parent and a composer may consume.
+ * `all_frames` also injects into chatgpt.com's own nested frames (auth, bot
+ * check, analytics); those used to run the old consume path too and could win
+ * the race for a delivery meant for the visible composer.
  *
  * Why not just set `innerHTML`?
  *   ChatGPT's composer is a ProseMirror editor wrapped in React. Writing DOM
  *   directly updates pixels but not the editor state, so the Send button stays
- *   disabled and Enter submits nothing. `execCommand('insertText')` goes through
- *   the browser's editing pipeline, which fires `beforeinput`/`input` with
- *   `inputType: insertText` — exactly what ProseMirror listens for.
+ *   disabled and Enter submits nothing — and the next React render paints the
+ *   state back over the DOM, which makes the text vanish. `execCommand`
+ *   ('insertText') goes through the browser's editing pipeline, which fires
+ *   `beforeinput`/`input` with `inputType: insertText` — exactly what
+ *   ProseMirror listens for.
  */
 
 (() => {
@@ -36,20 +45,59 @@
     'button[aria-label*="发送"]'
   ];
 
-  const PASTE_KEY = 'pendingPaste';
+  const PASTE_PREFIX = 'paste:';
+  const ACK_KEY = 'pendingPasteAck';
+  /** Deliveries older than this are dropped rather than pasted late. */
+  const PASTE_TTL = 30000;
+  /**
+   * How long a delivery waits for the composer. A cold panel has to boot the
+   * whole ChatGPT SPA — loading, hydration and a possible session redirect all
+   * happen inside this window, and the old 3s budget routinely ran out.
+   */
+  const COMPOSER_TIMEOUT = 20000;
+
   const FLASH_COLOR = 'rgba(16, 163, 127, 0.25)';
 
   /**
-   * The sidebar hosts ChatGPT inside a frame, so only embedded frames should
-   * consume deliveries. Without this guard, having chatgpt.com open in a normal
-   * tab would make that tab swallow prompts meant for the sidebar.
+   * Whether this frame is the chatgpt.com document embedded by the extension
+   * (side panel, or the popup fallback window).
+   * @returns {boolean}
    */
-  const IS_EMBEDDED = window.top !== window;
+  function isExtensionHosted() {
+    if (window.top === window) return false;
 
-  /** Ids already consumed, so a storage echo cannot paste twice. */
-  let handledId = null;
+    try {
+      const parentOrigin = window.location.ancestorOrigins?.[0];
+      if (parentOrigin && parentOrigin !== 'null') {
+        return parentOrigin.startsWith('chrome-extension://');
+      }
+    } catch {
+      /* ancestorOrigins is not available everywhere */
+    }
+
+    // Fallback: a cross-origin parent only contributes its origin, and the
+    // extension page's origin is exactly what we are looking for.
+    try {
+      return document.referrer.startsWith('chrome-extension://');
+    } catch {
+      return false;
+    }
+  }
+
+  // A plain chatgpt.com tab, or any nested frame inside one, has no business
+  // consuming deliveries: it would steal them from the panel.
+  if (!isExtensionHosted()) return;
 
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+  /**
+   * Whitespace-insensitive comparison. ProseMirror turns `\n` into real
+   * paragraph elements, and `textContent` walks them back together without
+   * separators — so a byte comparison against the original text would report
+   * a mismatch for every multi-line prompt that was in fact inserted fine.
+   * @param {string} value
+   */
+  const flatten = value => (value || '').replace(/\s+/g, '');
 
   // ===========================================================================
   // Composer lookup
@@ -64,11 +112,33 @@
   }
 
   /**
+   * An element that occupies space on screen. ChatGPT ships hidden `textarea`
+   * and `contenteditable` helpers, and the loose selectors above match them —
+   * treating one of those as "the UI is ready" is what let the panel drop its
+   * loading cover while the screen was still blank.
+   * @param {Element|null} el
+   */
+  function isVisible(el) {
+    if (!el || typeof el.getBoundingClientRect !== 'function') return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }
+
+  /** The composer only counts once it is actually on screen. */
+  function findVisibleComposer() {
+    for (const selector of COMPOSER_SELECTORS) {
+      const el = document.querySelector(selector);
+      if (isVisible(el)) return el;
+    }
+    return null;
+  }
+
+  /**
    * Waits for the composer to exist instead of retrying forever.
    * Resolves with the element, or null when the timeout expires.
    * @param {number} timeout ms
    */
-  function waitForComposer(timeout = 15000) {
+  function waitForComposer(timeout = COMPOSER_TIMEOUT) {
     const existing = findComposer();
     if (existing) return Promise.resolve(existing);
 
@@ -96,7 +166,10 @@
   // Writing into the composer
   // ===========================================================================
 
-  /** Sets a value on a textarea through React's value tracker. */
+  /**
+   * Sets a value on a textarea through React's value tracker.
+   * @returns {boolean} whether the value stuck
+   */
   function setTextareaValue(textarea, value) {
     const setter = Object.getOwnPropertyDescriptor(
       HTMLTextAreaElement.prototype,
@@ -109,6 +182,9 @@
 
     textarea.dispatchEvent(new Event('input', { bubbles: true }));
     textarea.dispatchEvent(new Event('change', { bubbles: true }));
+
+    caretToEnd(textarea);
+    return flatten(textarea.value) === flatten(value);
   }
 
   /** Selects the whole composer content so an insert replaces it. */
@@ -132,38 +208,67 @@
     selection.addRange(range);
   }
 
-  /** @returns {boolean} whether the text made it into the editor. */
+  /**
+   * Types `text` through the editing pipeline, paragraph by paragraph.
+   * Never touches `textContent` / `innerHTML`: that leaves ProseMirror's state
+   * empty, so the editor paints the text away on its next render.
+   * @returns {boolean} whether the text made it into the editor
+   */
   function insertIntoEditable(element, text) {
     element.focus();
     selectAllIn(element);
 
-    // Preferred path: goes through the editing pipeline (ProseMirror aware).
-    let ok = false;
+    // Preferred path: one call, the browser splits paragraphs itself.
     try {
-      ok = document.execCommand('insertText', false, text);
+      document.execCommand('insertText', false, text);
     } catch {
-      ok = false;
+      /* fall through to the per-line path */
+    }
+    if (flatten(element.textContent) === flatten(text)) {
+      caretToEnd(element);
+      return true;
     }
 
-    if (!ok || element.textContent.trim() !== text.trim()) {
-      // Fallback for editors that ignore execCommand.
-      element.textContent = '';
-      const paragraph = document.createElement('p');
-      paragraph.textContent = text;
-      element.appendChild(paragraph);
+    // Second path: some builds refuse a multi-line insertText but accept a
+    // paragraph break between two single-line inserts.
+    element.focus();
+    selectAllIn(element);
 
-      element.dispatchEvent(
-        new InputEvent('input', {
-          bubbles: true,
-          cancelable: true,
-          inputType: 'insertText',
-          data: text
-        })
-      );
+    const lines = text.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      try {
+        if (line) document.execCommand('insertText', false, line);
+      } catch {
+        return false;
+      }
+
+      if (i === lines.length - 1) break;
+
+      let broke = false;
+      try {
+        broke = document.execCommand('insertParagraph');
+      } catch {
+        broke = false;
+      }
+      if (!broke) {
+        try {
+          broke = document.execCommand('insertLineBreak');
+        } catch {
+          broke = false;
+        }
+      }
+      if (!broke) {
+        try {
+          document.execCommand('insertText', false, '\n');
+        } catch {
+          return false;
+        }
+      }
     }
 
     caretToEnd(element);
-    return true;
+    return flatten(element.textContent) === flatten(text);
   }
 
   /**
@@ -244,51 +349,266 @@
   }
 
   // ===========================================================================
-  // Paste pipeline
+  // Delivery channel
   // ===========================================================================
 
+  /** Reports back to the panel: the only source of a success toast. */
+  async function publishAck(item, ok, reason) {
+    try {
+      await chrome.storage.local.set({
+        [ACK_KEY]: {
+          id: item.id,
+          ok,
+          reason,
+          preview: item.preview || (item.text || '').slice(0, 42),
+          ts: Date.now()
+        }
+      });
+    } catch {
+      /* the panel falls back to its own timeout message */
+    }
+  }
+
+  /** Drops one delivery. Only the claimed key is removed, never the whole set. */
+  async function dropDelivery(item) {
+    try {
+      await chrome.storage.local.remove(item.key);
+    } catch {
+      /* a stale key is swept by the next write */
+    }
+  }
+
   /**
-   * @param {string} text
-   * @param {string|null} id  Storage id of this delivery, used for de-duping.
+   * Oldest fresh delivery that this document has not touched yet, or null.
+   * Expired ones are removed here so they can never replay later.
    */
-  async function pastePrompt(text, id = null) {
-    if (!text) return;
+  async function nextDelivery(handled) {
+    const all = await chrome.storage.local.get(null);
+    const now = Date.now();
 
-    // Only the frame that actually owns a composer should react.
-    const composer = await waitForComposer(3000);
-    if (!composer) return;
+    const entries = Object.keys(all)
+      .filter(key => key.startsWith(PASTE_PREFIX))
+      .map(key => ({ key, ...all[key] }))
+      .filter(item => item?.id && item.text);
 
-    if (composer.tagName === 'TEXTAREA') {
-      setTextareaValue(composer, text);
-    } else {
-      insertIntoEditable(composer, text);
+    const expired = entries
+      .filter(item => now - (item.ts || 0) > PASTE_TTL)
+      .map(item => item.key);
+    if (expired.length) await chrome.storage.local.remove(expired);
+
+    const fresh = entries
+      .filter(item => now - (item.ts || 0) <= PASTE_TTL && !handled.has(item.id))
+      .sort((a, b) => (a.ts || 0) - (b.ts || 0));
+
+    return fresh[0] || null;
+  }
+
+  /**
+   * Fills the composer with one delivery.
+   * @returns {Promise<boolean>} false when the composer was never usable
+   */
+  async function applyDelivery(item) {
+    const composer = await waitForComposer();
+    if (!composer) {
+      await publishAck(item, false, 'no-composer');
+      await dropDelivery(item);
+      return false;
+    }
+
+    const ok =
+      composer.tagName === 'TEXTAREA'
+        ? setTextareaValue(composer, item.text)
+        : insertIntoEditable(composer, item.text);
+
+    if (!ok) {
+      await publishAck(item, false, 'insert-failed');
+      await dropDelivery(item);
+      return false;
     }
 
     flash(composer);
-
-    if (id) await chrome.storage.local.remove(PASTE_KEY);
+    await publishAck(item, true, 'inserted');
+    await dropDelivery(item);
 
     await maybeAutoSubmit();
+    return true;
   }
 
-  /** Consumes a `pendingPaste` payload exactly once. */
-  function consume(payload) {
-    if (!IS_EMBEDDED) return;
-    if (!payload || !payload.text) return;
-    if (payload.id && payload.id === handledId) return;
-    handledId = payload.id || null;
-    pastePrompt(payload.text, payload.id || null);
+  /**
+   * Single-flight worker over the delivery keys. Runs one delivery at a time so
+   * a slow first one cannot interleave with a second write into the same
+   * composer, and stops early once the composer proves unavailable.
+   */
+  let draining = false;
+  let retryTimer = null;
+  const handled = new Set();
+
+  /**
+   * A delivery that arrived while the worker was busy is only visible through
+   * storage, and nothing would wake the worker again once it gives up. One
+   * bounded retry covers a ChatGPT that needs a little longer than the wait.
+   */
+  function scheduleRetry() {
+    if (retryTimer) return;
+    retryTimer = setTimeout(() => {
+      retryTimer = null;
+      void drain();
+    }, 5000);
   }
+
+  async function drain() {
+    if (draining) return;
+    draining = true;
+
+    try {
+      for (;;) {
+        const item = await nextDelivery(handled);
+        if (!item) break;
+
+        handled.add(item.id);
+        const ok = await applyDelivery(item);
+        if (!ok) {
+          scheduleRetry();
+          break;
+        }
+      }
+    } catch (err) {
+      console.warn('[sidebar] delivery failed:', err);
+    } finally {
+      draining = false;
+    }
+  }
+
+  // ===========================================================================
+  // Readiness signal
+  // ===========================================================================
+
+  /**
+   * The panel cannot see inside this frame, and `iframe.onload` fires as soon
+   * as the HTML arrives — which for ChatGPT is long before anything is painted.
+   * The SPA still has to download its bundle, hydrate and fetch the session, and
+   * the panel used to lift its loading cover right at `load`, exposing exactly
+   * the blank screen it was meant to hide.
+   *
+   * The composer showing up is the first moment the UI is actually usable, so
+   * that is what gets reported. Only extension-hosted frames get this far
+   * (see the guard above), so a normal chatgpt.com tab never sends it.
+   */
+  let announced = false;
+
+  const readyObserver = new MutationObserver(() => announceReady());
+
+  /**
+   * Pages that are *not* the chat UI but are perfectly valid destinations: the
+   * login form and the bot check. Waiting for a composer that will never come
+   * would leave the panel's loading cover on top of the form the user has to
+   * fill in.
+   */
+  const INTERSTITIAL_SELECTORS = [
+    'input[name="username"]',
+    'input[name="email"][type="email"]',
+    'button[data-testid="login-button"]',
+    'form[action*="login"]',
+    '#challenge-stage',
+    '#cf-challenge-running'
+  ];
+
+  /** @returns {{ready: boolean, reason: string}} */
+  function detectReady() {
+    if (findVisibleComposer()) return { ready: true, reason: 'composer' };
+
+    for (const selector of INTERSTITIAL_SELECTORS) {
+      if (isVisible(document.querySelector(selector))) {
+        return { ready: true, reason: 'interstitial' };
+      }
+    }
+
+    return { ready: false, reason: '' };
+  }
+
+  function announceReady() {
+    if (announced) return;
+
+    const mark = detectReady();
+    if (!mark.ready) return;
+
+    announced = true;
+    readyObserver.disconnect();
+
+    try {
+      // MV3 returns a promise; nobody listening rejects it, which would surface
+      // as an unhandled rejection in the page console.
+      chrome.runtime
+        .sendMessage({ type: 'CHATGPT_READY', reason: mark.reason, ts: Date.now() })
+        ?.catch?.(() => {});
+    } catch {
+      /* panel already closed; nobody to tell */
+    }
+  }
+
+  announceReady();
+  if (!announced) {
+    readyObserver.observe(document.documentElement, { childList: true, subtree: true });
+  }
+
+  // ===========================================================================
+  // Theme signal
+  // ===========================================================================
+
+  /**
+   * The panel paints a cover over this frame and cannot look inside it, so the
+   * theme has to be volunteered. Guessing wrong is very visible: a dark cover
+   * over a light ChatGPT ends in a black → white flash the moment it lifts,
+   * which reads as the panel having failed to load.
+   */
+  let lastTheme = '';
+
+  function readTheme() {
+    try {
+      const cls = document.documentElement.className || '';
+      if (/(^|\s)dark(\s|$)/.test(cls)) return 'dark';
+      if (/(^|\s)light(\s|$)/.test(cls)) return 'light';
+
+      // Fallback: judge by the page's own background.
+      const bg = getComputedStyle(document.body || document.documentElement).backgroundColor;
+      const parts = /rgba?\((\d+),\s*(\d+),\s*(\d+)/.exec(bg || '');
+      if (!parts) return '';
+
+      const [r, g, b] = [parts[1], parts[2], parts[3]].map(v => Number(v) / 255);
+      return 0.2126 * r + 0.7152 * g + 0.0722 * b > 0.5 ? 'light' : 'dark';
+    } catch {
+      return '';
+    }
+  }
+
+  function reportTheme() {
+    const theme = readTheme();
+    if (!theme || theme === lastTheme) return;
+
+    lastTheme = theme;
+    try {
+      chrome.runtime.sendMessage({ type: 'CHATGPT_THEME', theme })?.catch?.(() => {});
+    } catch {
+      /* panel already closed */
+    }
+  }
+
+  reportTheme();
+
+  new MutationObserver(reportTheme).observe(document.documentElement, {
+    attributes: true,
+    attributeFilter: ['class', 'style', 'data-theme']
+  });
 
   // ===========================================================================
   // Listeners
   // ===========================================================================
 
-  // Primary channel: the service worker / custom-prompt popup publish here.
+  // Primary channel: the service worker publishes one `paste:<id>` key each.
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area !== 'local') return;
-    if (!changes[PASTE_KEY]?.newValue) return;
-    consume(changes[PASTE_KEY].newValue);
+    if (!Object.keys(changes).some(key => key.startsWith(PASTE_PREFIX))) return;
+    void drain();
   });
 
   // Secondary channel, kept for automation and manual testing:
@@ -296,24 +616,29 @@
   window.addEventListener('message', event => {
     if (event.origin !== window.location.origin) return;
     const data = event.data;
-    if (data?.type === 'CHATGPT_SIDEBAR_PASTE' && data.text) {
-      pastePrompt(String(data.text));
-    }
+    if (data?.type !== 'CHATGPT_SIDEBAR_PASTE' || !data.text) return;
+
+    void (async () => {
+      const composer = await waitForComposer();
+      if (!composer) return;
+      insertIntoEditable(composer, String(data.text));
+    })();
   });
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-    if (message?.type === 'PASTE_TO_CHATGPT' && message.text) {
-      pastePrompt(String(message.text));
-      sendResponse({ ok: true });
-    }
-    return false;
+    if (message?.type !== 'PASTE_TO_CHATGPT' || !message.text) return false;
+
+    void (async () => {
+      const composer = await waitForComposer();
+      const ok = !!composer && insertIntoEditable(composer, String(message.text));
+      sendResponse({ ok });
+    })();
+
+    return true;
   });
 
-  // Anything delivered while the panel was still loading.
-  chrome.storage.local.get(PASTE_KEY).then(result => {
-    const payload = result?.[PASTE_KEY];
-    if (!payload) return;
-    // Let the composer mount before writing into it.
-    setTimeout(() => consume(payload), 600);
-  });
+  // Anything delivered while the panel was still booting. The worker starts
+  // before the composer exists and keeps waiting for it, so this no longer
+  // races the ChatGPT SPA.
+  void drain();
 })();

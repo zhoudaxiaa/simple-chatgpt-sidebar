@@ -1,4 +1,9 @@
-import { formatTemplate, formatPagePrompt, formatSelectionPrompt } from './shared/template.js';
+import {
+  formatTemplate,
+  formatPagePrompt,
+  formatSelectionPrompt,
+  stripEmptyLabels
+} from './shared/template.js';
 import {
   DEFAULT_PAGE_PROMPTS,
   DEFAULT_SELECTION_PROMPTS,
@@ -46,6 +51,61 @@ eq(
   formatPagePrompt({ template: '', includeUrl: true }, { title: 'T', url: 'u' }),
   `标题：T${NL}链接：u`
 );
+
+// Regression: a Tab from contextMenus.onClicked has no url/title unless the
+// extension holds the tabs permission, which this one deliberately avoids.
+eq(
+  'missing identity block is omitted',
+  formatPagePrompt(DEFAULT_PAGE_PROMPTS[0], {}),
+  '请总结这个网页：'
+);
+
+eq(
+  'unknown tab object does not crash',
+  formatPagePrompt(DEFAULT_PAGE_PROMPTS[0], undefined),
+  '请总结这个网页：'
+);
+
+eq(
+  'title-only identity keeps one line',
+  formatPagePrompt(DEFAULT_PAGE_PROMPTS[0], { title: 'Docs' }),
+  `请总结这个网页：${NL}${NL}标题：Docs`
+);
+
+eq(
+  'url-only identity keeps one line',
+  formatPagePrompt({ template: '', includeUrl: true }, { url: 'https://x.dev' }),
+  '链接：https://x.dev'
+);
+
+eq(
+  'nothing to send when identity is empty',
+  formatPagePrompt({ template: '', includeUrl: true }, {}),
+  ''
+);
+
+// Regression: templates saved by older builds can carry the labels literally,
+// which leaves "标题：" / "链接：" dangling when the identity is unknown.
+eq(
+  'literal labels in a stored template are stripped when empty',
+  formatPagePrompt(
+    { template: `请总结这个网页：${NL}${NL}标题：{title}${NL}链接：{url}`, includeUrl: false },
+    {}
+  ),
+  '请总结这个网页：'
+);
+
+eq(
+  'literal labels are kept when the identity is known',
+  formatPagePrompt(
+    { template: `请总结这个网页：${NL}${NL}标题：{title}${NL}链接：{url}`, includeUrl: false },
+    { title: 'Docs', url: 'https://x.dev' }
+  ),
+  `请总结这个网页：${NL}${NL}标题：Docs${NL}链接：https://x.dev`
+);
+
+eq('stripEmptyLabels keeps normal lines', stripEmptyLabels(`a${NL}b`), `a${NL}b`);
+eq('stripEmptyLabels removes only empty labels', stripEmptyLabels(`标题：X${NL}链接：`), '标题：X');
 
 // --- English-default migration ----------------------------------------------
 
