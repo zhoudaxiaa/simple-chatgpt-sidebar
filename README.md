@@ -64,6 +64,7 @@ python tools/make_icons.py
 - **模板占位符** —— `{text}` 注入选中内容，`{title}` / `{url}` 注入页面信息，可关掉自动追加链接
 - **自动填词** —— 用 `execCommand('insertText')` 写入 ProseMirror 编辑器，编辑器状态同步，发送按钮会正常点亮
 - **自动发送（可选）** —— 先尝试点发送按钮，拿不到再退回合成 Enter
+- **站外链接在浏览器标签页打开** —— 对话里点外链不会把面板导航走（侧边栏没有后退键），交给后台 `chrome.tabs.create`，在当前窗口开新标签；站内链接、登录跳转、`mailto:` 与下载仍走原样
 - **登录态同步** —— 把 `chatgpt.com` / `openai.com` 的 Cookie 发给本机 Electron 套壳，省掉在桌面端重新登录（默认关闭需手动开）
 - **全中文界面** —— 菜单、设置页、弹窗、提示条、默认提示词；已装过英文版的会就地迁移，用户改过的条目不动
 
@@ -103,7 +104,7 @@ python tools/validate.py
 # 单元测试：模板渲染 / 英文旧数据迁移 / Cookie 去重（34 例）
 node test_template.mjs
 
-# 投递链路：vm 里跑真实注入脚本，验证认领 / 回执 / 失败清理 / TTL（30 例）
+# 投递链路：vm 里跑真实注入脚本，验证认领 / 回执 / 失败清理 / TTL / 外链路由（44 例）
 node test_delivery.mjs
 
 # 页面身份回退链：content script → activeTab 注入 → Tab 字段（6 例）

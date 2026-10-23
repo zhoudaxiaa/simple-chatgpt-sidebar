@@ -378,6 +378,44 @@ async function sweepStalePastes() {
 }
 
 // =============================================================================
+// Link routing
+// =============================================================================
+
+/**
+ * Opens a link the user clicked inside the panel as a real tab.
+ *
+ * Without this, an external link clicked in the ChatGPT frame navigates that
+ * frame: ChatGPT is replaced by the target page and the panel has no back
+ * button, so the only way back is closing and reopening it — which also means
+ * a fresh cold start.
+ *
+ * `chrome.tabs.create` needs no `tabs` permission (that one only gates reading
+ * existing tabs), so this adds no new permission prompt.
+ *
+ * @param {string} rawUrl
+ * @returns {Promise<{ok: boolean, reason?: string}>}
+ */
+async function openLinkInTab(rawUrl) {
+  let url;
+  try {
+    url = new URL(String(rawUrl || ''));
+  } catch {
+    return { ok: false, reason: 'invalid-url' };
+  }
+
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    return { ok: false, reason: 'unsupported-scheme' };
+  }
+
+  try {
+    await chrome.tabs.create({ url: url.href, active: true });
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, reason: 'open-failed', detail: String(err) };
+  }
+}
+
+// =============================================================================
 // Desktop session bridge
 //
 // The toolbar button already opens the side panel, so the bridge hangs off two
@@ -556,6 +594,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         .then(() => chrome.storage.local.remove([KEY.pageInfo, KEY.promptTabId]))
         .then(() => sendResponse({ ok: true }))
         .catch(err => sendResponse({ ok: false, error: String(err) }));
+      return true;
+
+    case 'OPEN_LINK_IN_TAB':
+      openLinkInTab(message.url)
+        .then(result => sendResponse(result))
+        .catch(err => sendResponse({ ok: false, reason: 'exception', detail: String(err) }));
       return true;
 
     case 'SYNC_SESSION':

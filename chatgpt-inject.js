@@ -601,6 +601,123 @@
   });
 
   // ===========================================================================
+  // Link routing
+  // ===========================================================================
+
+  /**
+   * A plain left click on a link inside the panel used to navigate the panel
+   * itself: ChatGPT was replaced by the target page, and since a side panel has
+   * no back button the only way out was closing and reopening it — a fresh cold
+   * start, several seconds of loading, lost scroll position.
+   *
+   * So external links are handed to the service worker, which opens them as a
+   * normal tab in the window that hosts the panel. In-site links (another
+   * conversation, settings) still navigate in place, because that is what the
+   * panel is for.
+   */
+
+  /**
+   * Hosts the sign-in flow travels through. Opening one of these in another tab
+   * would drop the session cookie somewhere the panel cannot see, so the click
+   * is left alone and the navigation stays inside the panel.
+   */
+  const AUTH_HOSTS = [
+    'auth.openai.com',
+    'auth0.openai.com',
+    'accounts.google.com',
+    'login.microsoftonline.com',
+    'login.live.com',
+    'appleid.apple.com'
+  ];
+
+  /** Paths where every link belongs to the sign-in flow. */
+  const AUTH_PATH = /^\/(auth|login|log-in|signup|sign-up)(\/|$)/i;
+
+  /** The nearest anchor in the event path, shadow DOM included. */
+  function findAnchor(event) {
+    if (typeof event.composedPath === 'function') {
+      for (const node of event.composedPath()) {
+        if (node && node.tagName === 'A' && node.href) return node;
+      }
+    }
+
+    let node = event.target;
+    while (node && node !== document) {
+      if (node.tagName === 'A' && node.href) return node;
+      node = node.parentNode;
+    }
+    return null;
+  }
+
+  /**
+   * @param {HTMLAnchorElement} anchor
+   * @returns {string|null} url to open in a tab, or null to leave the click be
+   */
+  function externalTarget(anchor) {
+    if (anchor.hasAttribute && anchor.hasAttribute('download')) return null;
+
+    let url;
+    try {
+      url = new URL(anchor.href, window.location.href);
+    } catch {
+      return null;
+    }
+
+    // mailto:, tel:, blob:, javascript: — the browser handles those better.
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
+
+    // Same site: keep it in the panel, the SPA router knows what to do.
+    if (url.origin === window.location.origin) return null;
+
+    if (AUTH_PATH.test(window.location.pathname || '')) return null;
+    if (AUTH_HOSTS.some(host => url.hostname === host || url.hostname.endsWith(`.${host}`))) {
+      return null;
+    }
+
+    return url.href;
+  }
+
+  async function openInTab(url) {
+    try {
+      const result = await chrome.runtime.sendMessage({ type: 'OPEN_LINK_IN_TAB', url });
+      if (result?.ok) return;
+    } catch {
+      /* worker asleep or extension context gone */
+    }
+
+    // Last resort: a popup window, still outside the panel.
+    try {
+      window.open(url, '_blank', 'noopener');
+    } catch {
+      /* popup blocked; nothing else to try */
+    }
+  }
+
+  // Capture phase: run before ChatGPT's own handlers, so the SPA router never
+  // sees an external click and cannot navigate the frame out from under us.
+  document.addEventListener(
+    'click',
+    event => {
+      if (event.defaultPrevented) return;
+      // Modified and middle clicks keep the browser's own behaviour: new tab,
+      // new window, download — all of which already land outside the panel.
+      if (event.button !== 0) return;
+      if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+
+      const anchor = findAnchor(event);
+      if (!anchor) return;
+
+      const url = externalTarget(anchor);
+      if (!url) return;
+
+      event.preventDefault();
+      event.stopPropagation();
+      void openInTab(url);
+    },
+    true
+  );
+
+  // ===========================================================================
   // Listeners
   // ===========================================================================
 

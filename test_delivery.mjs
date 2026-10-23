@@ -11,6 +11,7 @@
  *   3. an expired delivery is dropped without touching the composer
  *   4. a nested chatgpt.com frame never consumes (ownership guard)
  *   5. a top-level chatgpt.com tab never consumes (ownership guard)
+ *   6. external links leave the panel instead of navigating it
  *
  * Run: node test_delivery.mjs
  */
@@ -41,7 +42,7 @@ const flatten = value => (value || '').replace(/\s+/g, '');
  * @param {boolean} options.isTopFrame
  * @param {boolean} options.fireChangeEvents  whether writes notify listeners
  */
-function runInjector({ stored = {}, hasComposer = true, ancestorOrigins = ['chrome-extension://abc'], isTopFrame = false, fireChangeEvents = true, execMode = 'ok', composerBox = { width: 320, height: 48 }, htmlClass = '' } = {}) {
+function runInjector({ stored = {}, hasComposer = true, ancestorOrigins = ['chrome-extension://abc'], isTopFrame = false, fireChangeEvents = true, execMode = 'ok', composerBox = { width: 320, height: 48 }, htmlClass = '', pageHref = 'https://chatgpt.com/', pagePath = '/' } = {}) {
   /** @type {Record<string, any>} */
   const store = { ...stored };
   const changeListeners = [];
@@ -49,6 +50,10 @@ function runInjector({ stored = {}, hasComposer = true, ancestorOrigins = ['chro
   const readyMessages = [];
   /** Every CHATGPT_THEME the injector sent, in order. */
   const themeMessages = [];
+  /** Every OPEN_LINK_IN_TAB the injector sent, in order. */
+  const linkMessages = [];
+  /** Capture-phase click listeners the injector registered. */
+  const clickListeners = [];
   /** Models the DOM selection: replace-on-first-insert, append afterwards. */
   const selection = { active: false };
 
@@ -94,11 +99,18 @@ function runInjector({ stored = {}, hasComposer = true, ancestorOrigins = ['chro
       }
       return false;
     },
-    addEventListener() {}
+    addEventListener(type, fn, capture) {
+      if (type === 'click' && capture) clickListeners.push(fn);
+    }
   };
 
   const window = {
-    location: { ancestorOrigins, origin: 'https://chatgpt.com', href: 'https://chatgpt.com/' },
+    location: {
+      ancestorOrigins,
+      origin: 'https://chatgpt.com',
+      href: pageHref,
+      pathname: pagePath
+    },
     getSelection() {
       return {
         removeAllRanges() {
@@ -109,6 +121,7 @@ function runInjector({ stored = {}, hasComposer = true, ancestorOrigins = ['chro
         }
       };
     },
+    open() {},
     addEventListener() {}
   };
   window.top = isTopFrame ? window : {};
@@ -145,6 +158,10 @@ function runInjector({ stored = {}, hasComposer = true, ancestorOrigins = ['chro
       sendMessage: message => {
         if (message?.type === 'CHATGPT_READY') readyMessages.push(message);
         if (message?.type === 'CHATGPT_THEME') themeMessages.push(message);
+        if (message?.type === 'OPEN_LINK_IN_TAB') {
+          linkMessages.push(message);
+          return Promise.resolve({ ok: true });
+        }
         return Promise.resolve();
       },
       lastError: undefined
@@ -175,13 +192,50 @@ function runInjector({ stored = {}, hasComposer = true, ancestorOrigins = ['chro
     String,
     Number,
     JSON,
+    URL,
     KeyboardEvent: class {}
   };
 
   vm.createContext(sandbox);
   vm.runInContext(SOURCE, sandbox, { filename: 'chatgpt-inject.js' });
 
-  return { store, composer, readyMessages, themeMessages };
+  /**
+   * Fires a click the way a browser would: through the capture listeners the
+   * injector registered on `document`.
+   * @param {string} href
+   */
+  function click(href, { button = 0, ctrlKey = false, metaKey = false, shiftKey = false, altKey = false, download = false } = {}) {
+    const anchor = {
+      tagName: 'A',
+      href,
+      parentNode: null,
+      hasAttribute: name => (name === 'download' ? download : false)
+    };
+
+    const event = {
+      type: 'click',
+      button,
+      ctrlKey,
+      metaKey,
+      shiftKey,
+      altKey,
+      defaultPrevented: false,
+      propagationStopped: false,
+      target: anchor,
+      composedPath: () => [anchor, document],
+      preventDefault() {
+        this.defaultPrevented = true;
+      },
+      stopPropagation() {
+        this.propagationStopped = true;
+      }
+    };
+
+    for (const listener of clickListeners) listener(event);
+    return event;
+  }
+
+  return { store, composer, readyMessages, themeMessages, linkMessages, click };
 }
 
 const settle = () => new Promise(resolve => setTimeout(resolve, 60));
@@ -342,6 +396,80 @@ const delivery = (id, text, ageMs = 0) => ({
   eq('no text without a working editor', composer._text, '');
   eq('ack reports insert-failed', store[ACK_KEY]?.reason, 'insert-failed');
   ok('failed insert is dropped', !(PASTE_PREFIX + 'six' in store));
+}
+
+// --- 8. link routing --------------------------------------------------------
+
+{
+  const { click, linkMessages } = runInjector({});
+  const event = click('https://example.com/article');
+  await settle();
+
+  eq('external link is handed to the worker', linkMessages[0]?.url, 'https://example.com/article');
+  eq('external link uses the routing message', linkMessages[0]?.type, 'OPEN_LINK_IN_TAB');
+  ok('external click is taken over', event.defaultPrevented);
+  eq('one tab request per click', linkMessages.length, 1);
+}
+
+{
+  // Another conversation: navigating inside the panel is the point.
+  const { click, linkMessages } = runInjector({});
+  const event = click('/c/abc123');
+  await settle();
+
+  eq('in-site link stays in the panel', linkMessages.length, 0);
+  ok('in-site click is not prevented', !event.defaultPrevented);
+}
+
+{
+  const { click, linkMessages } = runInjector({});
+  click('mailto:someone@example.com');
+  await settle();
+
+  eq('mailto is left to the browser', linkMessages.length, 0);
+}
+
+{
+  const { click, linkMessages } = runInjector({});
+  click('https://example.com/report.pdf', { download: true });
+  await settle();
+
+  eq('download links are left alone', linkMessages.length, 0);
+}
+
+{
+  // Opening the OAuth hop in another tab would strand the session.
+  const { click, linkMessages } = runInjector({});
+  const event = click('https://accounts.google.com/o/oauth2/v2/auth');
+  await settle();
+
+  eq('sign-in hosts stay in the panel', linkMessages.length, 0);
+  ok('sign-in click is not prevented', !event.defaultPrevented);
+}
+
+{
+  const { click, linkMessages } = runInjector({ pagePath: '/auth/login' });
+  click('https://help.openai.com/');
+  await settle();
+
+  eq('no routing while signing in', linkMessages.length, 0);
+}
+
+{
+  const { click, linkMessages } = runInjector({});
+  const event = click('https://example.com/article', { ctrlKey: true });
+  await settle();
+
+  eq('ctrl-click keeps the browser default', linkMessages.length, 0);
+  ok('ctrl-click is not prevented', !event.defaultPrevented);
+}
+
+{
+  const { click, linkMessages } = runInjector({ isTopFrame: true });
+  click('https://example.com/article');
+  await settle();
+
+  eq('a plain chatgpt.com tab keeps its own links', linkMessages.length, 0);
 }
 
 // --- report -----------------------------------------------------------------
